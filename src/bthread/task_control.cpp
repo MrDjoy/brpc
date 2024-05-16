@@ -32,6 +32,7 @@
 #include "bthread/timer_thread.h"         // global_timer_thread
 #include <gflags/gflags.h>
 #include "bthread/log.h"
+#include "butil/strings/string_split.h"
 
 DEFINE_int32(task_group_delete_delay, 1,
              "delay deletion of TaskGroup for so many seconds");
@@ -39,6 +40,57 @@ DEFINE_int32(task_group_runqueue_capacity, 4096,
              "capacity of runqueue in each TaskGroup");
 DEFINE_int32(task_group_yield_before_idle, 0,
              "TaskGroup yields so many times before idle");
+DEFINE_string(pthread_cpuset, "0-15", "");
+DEFINE_validator(pthread_cpuset, PthreadCpuSetValidators);
+
+extern cpu_set_t g_cpus;
+extern int numberOfProcessors = sysconf(_SC_NPROCESSORS_ONLN);
+static bool PthreadCpuSetValidators(const char* flag, const std::string& value) {
+  if (value.empty()) {
+    return true;
+  }
+  size_t pos = 0;
+  try {
+    if (pos = value.find("_") != std::string::npos) {
+      int cpulowid = atoi(value.substr(0, pos));
+      int cpuhighid = atoi(value.substr(pos + 1, value.size() - pos - 1));
+      if (cpulowid > cpuhighid) {
+        LOG(ERROR) << "invalid:" << flag << " set, cpulowid:" << cpulowid
+                   << " cpuhighid" << cpuhighid;
+        return false;
+      }
+      if (cpuhighid >= numberOfProcessors) {
+        LOG(ERROR) << "invalid:" << flag << " set, cpuhighid:" << cpuhighid;
+        return false;
+      }
+      CPU_ZERO(&g_cpus);
+      for (int i = cpulowid; i <= cpuhighid; i++) {
+        CPU_SET(i, &g_cpus);
+      }
+      return true;
+    }
+    std::vector<std::string> cpuset;
+    butil::SplitString(value, ',', &cpuset);
+    if (cpuset.size() > 0) {
+      CPU_ZERO(&g_cpus);
+
+      for (int i = 0; i < cpuset.size(); i++) {
+        int cpuid = atoi(cpuset[i]);
+        if ((cpuid) >= numberOfProcessors) {
+          LOG(ERROR) << "invalid:" << flag << " set, cpuid:" << cpuid;
+          return false;
+        }
+        CPU_SET(cpuid, &g_cpus);
+      }
+    }
+    return true;
+
+  } catch (const std::exception& e) {
+    LOG(ERROR) << e;
+    return false;
+  }
+  return true;
+}
 
 namespace bthread {
 
@@ -162,8 +214,14 @@ int TaskControl::init(int concurrency) {
     }
     
     _workers.resize(_concurrency);   
+    
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
     for (int i = 0; i < _concurrency; ++i) {
-        const int rc = pthread_create(&_workers[i], NULL, worker_thread, this);
+        if (CPU_COUNT(&g_cpus) > 0) {
+          pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &g_cpus);
+        }
+        const int rc = pthread_create(&_workers[i], &attr, worker_thread, this);
         if (rc) {
             LOG(ERROR) << "Fail to create _workers[" << i << "], " << berror(rc);
             return -1;
