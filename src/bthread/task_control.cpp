@@ -41,19 +41,23 @@ DEFINE_int32(task_group_runqueue_capacity, 4096,
 DEFINE_int32(task_group_yield_before_idle, 0,
              "TaskGroup yields so many times before idle");
 DEFINE_string(pthread_cpuset, "0-15", "");
-DEFINE_validator(pthread_cpuset, PthreadCpuSetValidators);
 
-extern cpu_set_t g_cpus;
-extern int numberOfProcessors = sysconf(_SC_NPROCESSORS_ONLN);
+namespace bthread {
+
+DECLARE_int32(bthread_concurrency);
+DECLARE_int32(bthread_min_concurrency);
+static cpu_set_t g_cpus;
 static bool PthreadCpuSetValidators(const char* flag, const std::string& value) {
   if (value.empty()) {
     return true;
   }
+  int numberOfProcessors = sysconf(_SC_NPROCESSORS_ONLN);
   size_t pos = 0;
   try {
-    if (pos = value.find("_") != std::string::npos) {
-      int cpulowid = atoi(value.substr(0, pos));
-      int cpuhighid = atoi(value.substr(pos + 1, value.size() - pos - 1));
+    pos = value.find("-");
+    if (pos != std::string::npos) {
+      int cpulowid = atoi(value.substr(0, pos).c_str());
+      int cpuhighid = atoi(value.substr(pos + 1, value.size() - pos - 1).c_str());
       if (cpulowid > cpuhighid) {
         LOG(ERROR) << "invalid:" << flag << " set, cpulowid:" << cpulowid
                    << " cpuhighid" << cpuhighid;
@@ -63,10 +67,21 @@ static bool PthreadCpuSetValidators(const char* flag, const std::string& value) 
         LOG(ERROR) << "invalid:" << flag << " set, cpuhighid:" << cpuhighid;
         return false;
       }
+      LOG(INFO) << "flag:" << flag << " value:" << value 
+      << " l:" << cpulowid << " h:" << cpuhighid << " pro:" << numberOfProcessors;
       CPU_ZERO(&g_cpus);
       for (int i = cpulowid; i <= cpuhighid; i++) {
         CPU_SET(i, &g_cpus);
       }
+
+      std::stringstream ss;
+      for (int i = 0; i < CPU_SETSIZE; i++) {
+          if (CPU_ISSET(i, &g_cpus)) {
+              ss << i << ",";
+          }
+      }
+      LOG(INFO) << "g_cpus set " << ss.str();
+      
       return true;
     }
     std::vector<std::string> cpuset;
@@ -75,7 +90,7 @@ static bool PthreadCpuSetValidators(const char* flag, const std::string& value) 
       CPU_ZERO(&g_cpus);
 
       for (int i = 0; i < cpuset.size(); i++) {
-        int cpuid = atoi(cpuset[i]);
+        int cpuid = atoi(cpuset[i].c_str());
         if ((cpuid) >= numberOfProcessors) {
           LOG(ERROR) << "invalid:" << flag << " set, cpuid:" << cpuid;
           return false;
@@ -86,16 +101,12 @@ static bool PthreadCpuSetValidators(const char* flag, const std::string& value) 
     return true;
 
   } catch (const std::exception& e) {
-    LOG(ERROR) << e;
+    LOG(ERROR) << e.what();
     return false;
   }
   return true;
 }
-
-namespace bthread {
-
-DECLARE_int32(bthread_concurrency);
-DECLARE_int32(bthread_min_concurrency);
+DEFINE_validator(pthread_cpuset, &PthreadCpuSetValidators);
 
 extern pthread_mutex_t g_task_control_mutex;
 extern BAIDU_THREAD_LOCAL TaskGroup* tls_task_group;
@@ -123,6 +134,17 @@ void* TaskControl::worker_thread(void* arg) {
     }
     BT_VLOG << "Created worker=" << pthread_self()
             << " bthread=" << g->main_tid();
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    pthread_getaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+    // 打印当前线程绑定的 CPU
+    std::stringstream ss;
+    for (int i = 0; i < CPU_SETSIZE; i++) {
+        if (CPU_ISSET(i, &cpuset)) {
+            ss << i << ",";
+        }
+    }
+    LOG(INFO) << "thread "<< pthread_self() << " is running on cpu " << ss.str();
 
     tls_task_group = g;
     c->_nworkers << 1;
@@ -219,7 +241,9 @@ int TaskControl::init(int concurrency) {
     pthread_attr_init(&attr);
     for (int i = 0; i < _concurrency; ++i) {
         if (CPU_COUNT(&g_cpus) > 0) {
-          pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &g_cpus);
+          if (0 != pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &g_cpus)) {
+            LOG(ERROR) << "set fails:" << CPU_COUNT(&g_cpus);
+          }
         }
         const int rc = pthread_create(&_workers[i], &attr, worker_thread, this);
         if (rc) {
@@ -251,12 +275,21 @@ int TaskControl::add_workers(int num) {
         return 0;
     }
     const int old_concurency = _concurrency.load(butil::memory_order_relaxed);
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+
     for (int i = 0; i < num; ++i) {
         // Worker will add itself to _idle_workers, so we have to add
         // _concurrency before create a worker.
         _concurrency.fetch_add(1);
+        if (CPU_COUNT(&g_cpus) > 0) {
+          if (0 != pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &g_cpus)) {
+            LOG(ERROR) << "set fails:" << CPU_COUNT(&g_cpus);
+          }
+        }
         const int rc = pthread_create(
-                &_workers[i + old_concurency], NULL, worker_thread, this);
+                &_workers[i + old_concurency], &attr, worker_thread, this);
         if (rc) {
             LOG(WARNING) << "Fail to create _workers[" << i + old_concurency
                          << "], " << berror(rc);
